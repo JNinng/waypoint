@@ -4,16 +4,18 @@
 
 ## 命令
 
-仓库有两个模块（`datapipeline` 是嵌套在根模块目录树内的独立模块，
-`./...` 模式会跳过嵌套模块，必须分别运行）：
+仓库有三个模块（`datapipeline` 与 `examples` 是嵌套在根模块目录树内的
+独立模块，`./...` 模式会跳过嵌套模块，必须分别运行）：
 
 ```bash
 go build ./... && go vet ./... && go test ./...    # 核心模块
-cd datapipeline && go test ./...                   # 扩展模块（replace => ../ 兜底解析）
+cd datapipeline && go test ./...                   # 扩展模块
+cd examples && go build ./... && go vet ./...      # 示例（改动导出 API 后必须编译校验）
 ```
 
-`go.work` 被 .gitignore 忽略；本地可自建（`go work use . ./datapipeline`），
-无 workspace 时上述命令依然成立。无外部依赖、无代码生成步骤；Go 1.26+。
+`go.work` 被 .gitignore 忽略；本地可自建（`go work use . ./datapipeline ./examples`），
+无 workspace 时上述命令依然成立（各模块 replace => ../ 兜底解析）。
+无外部依赖、无代码生成步骤；Go 1.26+。
 
 ## 模块与依赖方向
 

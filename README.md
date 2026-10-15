@@ -58,6 +58,11 @@ func (e *myEngine) Execute(ctx context.Context, s *state.BaseTaskState) (state.L
 }
 ```
 
+## 示例
+
+各场景的可运行示例见 [examples/](examples/)（独立模块，在本目录下 `go run ./<场景>`）：
+`custom-engine`（最小引擎与恢复）、`export`（分页导出断点续传）、`ingest`（JSONL 导入）、`outbox`（意图落盘与分发）、`saga`（补偿事务与 Resume），与设计 §6 关键流程一一对应。
+
 ## 关键语义（速查）
 
 - **失败语义**：`Execute` 返回 error = 可重试/可恢复（不落盘，下次 Run 恢复）；引擎在 `Execute` 内置 `PhaseFailed` 返回 nil = 优雅失败（唯一落盘失败路径）。框架不兜底写终态。
