@@ -528,7 +528,7 @@ func RunWithOutbox(ctx context.Context, repo state.StateRepository, eng engine.E
     taskID string, store Store, opts ...engine.RunOption) (*state.BaseTaskState, error)
 ```
 
-**调度层恢复契约（`RunWithOutbox` 实现）**：`engine.Run` 成功后，从 Run 返回的最终状态的 `outbox` 命名空间与 Store 已有消息对齐——缺失则幂等 `Append`（`ErrDuplicateID` 即跳过），再交由 Dispatch。覆盖「Run 成功但 Append 前崩溃」窗口。
+**调度层恢复契约（`RunWithOutbox` 实现）**：`engine.Run` 成功后，从 Run 返回的最终状态的 `outbox` 命名空间与 Store 已有消息对齐——缺失则幂等 `Append`（`ErrDuplicateID` 即跳过）。覆盖「Run 成功但 Append 前崩溃」窗口。对齐完成后的分发由调用方的 Dispatcher 完成（Handler 注册表属调用方，桥接函数不持有）。
 
 **消息值语义**：Message 在 Append 入参、FetchPending 返回、Handler 入参、`Accumulator.Messages` 返回处全链路按值传递/拷贝——存储内部状态不经指针外泄（与 §8 约束 23 呼应）。
 
@@ -690,7 +690,7 @@ sequenceDiagram
     RW->>Eng: engine.Run —— 意图随 checkpoint 原子落盘
     Note over RW,ST: 崩溃点：Run 成功但 Append 前——重调 RunWithOutbox 幂等恢复
     RW->>ST: 逐条 Append（ErrDuplicateID 跳过）
-    RW->>DP: DispatchPending
+    App->>DP: DispatchPending（调用方以自有 HandlerRegistry 分发）
     DP->>ST: FetchPending（含 processing——处理中崩溃重投）
     DP->>ST: UpdateStatus(processing)
     DP->>DP: Handler(ctx, msg)（幂等）
@@ -735,7 +735,7 @@ sequenceDiagram
 | `engine` | `Engine`、`PhaseSet`（含 `IsTerminal`/`IsRecoverable`）、`DefaultPhaseSet`、`Aligner`、`Progressor`、`Run`、`RunOption`/`WithRetry` |
 | `stream` | `Source`、`Sink`、`Positioner`、`Sizer`、`Stater`、`Finalizer`、`Pipeline`/`New`/`WithBatchSize`/`AsEngine`、`ChunkedSink`/`NewChunkedSink`、`OffsetSource`/`NewOffsetSource` |
 | `filestore` | `FileRepository`/`New` |
-| `outbox` | `Message`、`MessageStatus`（4 值）、`Handler`、`HandlerRegistry`、`Store`、`InMemoryStore`、`Dispatcher` 及选项、`Accumulator`、`ErrDuplicateID`、`RunWithOutbox`、`filestore.FileStore`/`New` |
+| `outbox` | `Message`（含 `Normalize`——后端 Append 时补默认字段）、`MessageStatus`（4 值）、`Handler`、`HandlerRegistry`、`Store`、`InMemoryStore`、`Dispatcher` 及选项、`Accumulator`、`ErrDuplicateID`、`RunWithOutbox`、`filestore.FileStore`/`New` |
 | `saga` | `SagaStatus`（6 值）、`StepStatus`（5 值）、`SagaStep`、`SagaState`、`SagaStore`、`InMemorySagaStore`、`Saga`、`SagaCoordinator`/`Run`/`Resume`、`WithSagaLogger` |
 | `datapipeline` | `Row`、`DataSource`、`DataTarget`、`export.New`、`ingest.New` 及选项 |
 
