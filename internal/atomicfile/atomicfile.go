@@ -42,8 +42,8 @@ func Save(path, tmpPath string, r io.Reader, perm fs.FileMode) (int64, error) {
 	return write(path, tmpPath, r, perm, false)
 }
 
-// CleanResidue 删除 dir 下文件名以 tmpSuffix 结尾的崩溃残留临时文件，
-// 供各后端构造入口复用（Load 与构造入口自动清理残留 tmp 的统一实现）。
+// CleanResidue 删除 dir 下文件名以 tmpSuffix 结尾的崩溃残留临时文件。
+// 各持久化后端在构造入口调用（构造入口自动清理残留 tmp 的统一实现）。
 func CleanResidue(dir, tmpSuffix string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {

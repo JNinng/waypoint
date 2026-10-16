@@ -14,7 +14,7 @@ import (
 
 // 绑定指纹三态中的「首 checkpoint 覆盖」：首个 Save（pending→running 步）
 // 成功、第二个业务步的 Save 失败 → 恢复时指纹已随首个 checkpoint 落盘，
-// fail closed 不得误拒（发现 2a 的回归锚点）。
+// fail closed 不得误拒。
 func TestExportFingerprintCoversFirstCheckpoint(t *testing.T) {
 	base := t.TempDir()
 	out := filepath.Join(base, "orders.jsonl")
