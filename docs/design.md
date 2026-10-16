@@ -270,8 +270,9 @@ func WithRetry(maxRetries int, delay time.Duration) RunOption // 仅作用于 Ex
 
 1. `All` 非空；`Initial ∈ All`（零值视作 `PhasePending`）；`Initial ∉ Terminal`。
 2. `Recoverable ⊆ All`、`Terminal ⊆ All`。
-3. `Recoverable ∩ Terminal ≠ ∅` 时终态优先：终态任务不触发 Align。
-4. `PhaseFailed ∈ All` 时必须 `PhaseFailed ∈ Terminal`（否则引擎置 failed 后循环不结束）。
+3. `PhaseFailed ∈ All` 时必须 `PhaseFailed ∈ Terminal`（否则引擎置 failed 后循环不结束）。
+
+`Recoverable` 与 `Terminal` 允许重叠，恢复判定时终态优先——终态任务不触发 Align（主循环第 3 步，非校验错误）。
 
 **Run 主循环语义**：
 
@@ -773,7 +774,7 @@ sequenceDiagram
 糖是**组合边界上的薄函数**：只做既有调用按固定顺序的转发，零新逻辑、零自有状态。准入门槛是**繁琐度**（多步样板 ≥ 3 句），不为「一概念一名」的对称性加糖（saga 调用已足够简短，故不配糖）。
 
 - **`waypoint.Task`（世系句柄）**：绑定 `状态目录 × 引擎（含源/产物）× taskID` ——三者同生共死，跨进程恢复以相同三元组重建。`Run` 每次调用只传 ctx（+可选重试）。句柄粒度必须是**世系**而非「绑定」：同一绑定多 id 会共享产物路径、互相覆盖分块（§5.4.1 一产物路径一世系）。
-- **工学定位**：Task 缩短正确用法，**不拦截错误用法**——安全由机制承载（TaskType 校验防跨引擎、绑定指纹防同引擎换路径、PhaseSet/指纹 fail-closed 防脏状态）。dir 合法性延迟到 Run 校验（构造不触盘）。
+- **易用性定位**：Task 缩短正确用法，**不拦截错误用法**——安全由机制承载（TaskType 校验防跨引擎、绑定指纹防同引擎换路径、PhaseSet/指纹 fail-closed 防脏状态）。dir 合法性延迟到 Run 校验（构造不触盘）。
 - **`DispatchUntilIdle`**：排空语义的诚实命名——无进展即停，不保证排空（失败消息带重试余量留在 pending；混合负载下余量会被连续消耗，分发器无退避）。
 - **非目标**：Task 不提供 Delete；根包不 re-export `state` 常量；不做 Kit/Builder 门面；不自动 Cleanup、不自动分发（责任归属不变，见 ADR-3 与 §6.3）。
 
