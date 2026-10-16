@@ -45,7 +45,8 @@ waypoint/                          # 核心库（单一 module）
 ├── internal/atomicfile/       # 原子写原语（全库唯一 tmp→Sync→Rename 实现）
 ├── filestore/                 # StateRepository 文件后端
 ├── outbox/                    # 调度层 outbox 模式
-│   └── filestore/             # outbox Store 文件后端
+│   ├── filestore/             # outbox Store 文件后端
+│   └── producer/              # 生产引擎骨架（ADR-12）
 └── saga/                      # 调度层 saga 模式
 
 datapipeline/                  # 扩展包（独立分发，核心不依赖）
@@ -70,7 +71,7 @@ internal/atomicfile ←── filestore / outbox.filestore（共用唯一原子�
 
 - `engine` 只依赖 `state`。
 - `stream` 依赖 `engine`/`state`（`Pipeline` 提供引擎骨架，由适配引擎组合）。
-- `outbox` / `saga` 是独立状态机，不依赖 `engine`；与引擎的组合由调用方完成，outbox 另提供桥接入口 `RunWithOutbox`（依赖 `engine` 与 `state`，见 §5.6）。
+- `outbox` / `saga` 是独立状态机，不依赖 `engine`；与引擎的组合由调用方完成，outbox 另提供桥接入口 `RunWithOutbox`（依赖 `engine` 与 `state`，见 §5.6）与生产引擎骨架 `outbox/producer`（组合 `engine`，见 §5.8、ADR-12）。
 - 根包 `waypoint` 是组合边界（ADR-10）：依赖 `engine`/`filestore`/`outbox`/`state`，仅做既有调用的顺序转发（糖），无业务逻辑、无自有状态类型以外的概念。
 - `datapipeline` 依赖核心包，核心包不得反向依赖它。
 
@@ -168,7 +169,7 @@ var (
 { "pipeline": { "count": <累计已处理项数>, "src": <Source 状态>, "sink": <Sink 状态> }, "outbox": [ <消息…> ] }
 ```
 
-各命名空间子块（`json.RawMessage`）的合并与拆分由组合引擎负责，框架不提供合并助手。`pipeline.count` 由 Pipeline 自身维护：无 Positioner 的管道以它作为 LSN（配对规则第 3 条的回退），随 checkpoint 原子保存。
+各命名空间子块（`json.RawMessage`）由各参与方自持装配——框架核心不提供通用合并助手：`pipeline` 由 Pipeline 自持（还原/持久化），`outbox` 由 `outbox.Collector` 自持（ADR-11），业务子块由组合引擎负责。`pipeline.count` 由 Pipeline 自身维护：无 Positioner 的管道以它作为 LSN（配对规则第 3 条的回退），随 checkpoint 原子保存。
 
 ---
 
@@ -534,6 +535,12 @@ func (a *Accumulator) Messages() []Message                                // 防
 func (a *Accumulator) MarshalPayload() (json.RawMessage, error)           // {"outbox":[...]}；空 → nil, nil
 func (a *Accumulator) UnmarshalPayload(data json.RawMessage) error        // 空 → nil；解析失败 → error
 
+// Collector 是生产引擎的装配器：把「还原已落盘意图 → 幂等收集 → 合并回
+// 命名空间」固化为每业务步的一对括号调用（ADR-11）。
+func (c *Collector) Restore(s *state.BaseTaskState) error // 每实例一次生效；跳过直接 Flush 会丢失已落盘意图
+func (c *Collector) Add(msg Message) error                // 在册即成功（重放幂等）；其他错误上抛
+func (c *Collector) Flush(s *state.BaseTaskState) error   // 空收集器不写命名空间；保留其他命名空间
+
 // 桥接入口：运行引擎并对齐意图到 Store（恢复契约的唯一实现）。
 // 对齐使用 Run 返回的最终状态，不二次 Load/反序列化。
 func RunWithOutbox(ctx context.Context, repo state.StateRepository, eng engine.Engine,
@@ -735,6 +742,40 @@ sequenceDiagram
 
 补偿互不阻断、终态三分、指纹一致才可恢复，是 saga 正确性的三个支点。
 
+### 5.8 Outbox 生产引擎骨架 `outbox/producer`
+
+**动机**：outbox 生产引擎的 Execute 对每个业务完全同构——引导步、步首还原已落盘意图（ADR-11）、按批推进、逐条派生收集、步末合并、耗尽收尾；业务本体只有「记录从哪来、意图怎么派生」。与 §5.3 收敛管道循环骨架同一动机：骨架下沉组件，编排不再是手抄样板（ADR-12）。
+
+**方案**：
+
+```go
+package producer // outbox/producer：组合 engine/outbox/state 为生产引擎
+
+// Source 产出待产意图的业务记录。
+// 契约：after 是已提交记录数（引擎 LSN），切片/分页型源据此定位本批起点；
+// 业务副作用（如把记录标记为已受理）在 Next 内完成——先副作用后意图收集
+// （§5.2 时序契约），副作用必须幂等；最后一批允许与 io.EOF 同次返回；
+// 同一 taskID 内意图 ID 必须由业务键唯一派生。
+type Source[Record any] interface {
+	Next(ctx context.Context, after int64, batchSize int) ([]Record, error)
+}
+
+// Derive 从一条业务记录派生一条不可逆操作意图；失败为可重试 error。
+type Derive[Record any] func(ctx context.Context, taskID string, r Record) (outbox.Message, error)
+
+// New 组合生产引擎：pending→running 引导步；每业务步 Restore 已落盘意图 →
+// 取一批 → 逐条派生并幂等收集 → Flush 合并回命名空间；源耗尽置 completed。
+// LSN = 已提交记录数（§8-8）；Phases = DefaultPhaseSet。
+func New[Record any](taskType string, src Source[Record], derive Derive[Record], opts ...Option[Record]) *Engine[Record]
+func WithBatchSize[Record any](n int) Option[Record] // 默认 1000；n < 1 panic
+```
+
+**不变量**：意图随 checkpoint 原子落盘（Flush 与 Save 同步边界）；派生失败为可重试 error——重放时已收集意图由 Collector 幂等消化（ADR-11）、已产生副作用由 Source 幂等契约消化。
+
+**失败模式**：记录源重放不幂等 → 副作用累积（Source 契约禁止）；派生对不同记录产生重复 ID → 视为已在册跳过（业务键必须唯一派生）；不可由记录数定位的游标型源（文件字节偏移等）→ 暂不支持（checklists 待确认；加可选 `stream.Stater` 属向后兼容扩展）。
+
+> 交叉引用：ADR-11（Collector）、ADR-12（骨架下沉）、§5.6（outbox 模式）。
+
 ---
 
 ## 7. 对外接口与配置
@@ -748,7 +789,8 @@ sequenceDiagram
 | `engine` | `Engine`、`PhaseSet`（含 `IsTerminal`/`IsRecoverable`）、`DefaultPhaseSet`、`Aligner`、`Progressor`、`Run`、`RunOption`/`WithRetry` |
 | `stream` | `Source`、`Sink`、`Positioner`、`Sizer`、`Stater`、`Finalizer`、`Pipeline`/`New`/`WithBatchSize`/`AsEngine`、`ChunkedSink`/`NewChunkedSink`、`OffsetSource`/`NewOffsetSource` |
 | `filestore` | `FileRepository`/`New` |
-| `outbox` | `Message`（含 `Normalize`——后端 Append 时补默认字段）、`MessageStatus`（4 值）、`Handler`、`HandlerRegistry`/`NewHandlerRegistry`、`Store`、`InMemoryStore`、`Dispatcher`（含 `DispatchUntilIdle`）及选项、`Accumulator`、`ErrDuplicateID`、`RunWithOutbox`、`filestore.FileStore`/`New` |
+| `outbox` | `Message`（含 `Normalize`——后端 Append 时补默认字段）、`MessageStatus`（4 值）、`Handler`、`HandlerRegistry`/`NewHandlerRegistry`、`Store`、`InMemoryStore`、`Dispatcher`（含 `DispatchUntilIdle`）及选项、`Accumulator`、`Collector`（命名空间装配，ADR-11）、`ErrDuplicateID`、`RunWithOutbox`、`filestore.FileStore`/`New` |
+| `outbox/producer` | `Source`、`Derive`、`Engine`/`New`/`WithBatchSize`——生产引擎骨架（ADR-12） |
 | `saga` | `SagaStatus`（6 值）、`StepStatus`（5 值）、`SagaStep`、`SagaState`、`SagaStore`、`InMemorySagaStore`、`Saga`、`SagaCoordinator`/`Run`/`Resume`、`WithSagaLogger` |
 | `datapipeline` | `Row`、`DataSource`、`DataTarget`、`export.New`/`Cleanup`、`ingest.New` 及选项（绑定指纹为内部机制，不占导出面） |
 
@@ -759,6 +801,7 @@ sequenceDiagram
 | 项 | 默认值 |
 |---|---|
 | 管道 batchSize / 导入批大小 / 导出 pageSize | 1000 |
+| producer 每批记录数（outbox） | 1000 |
 | 每块批数（ChunkedSink） | 10 |
 | Dispatcher maxRetries / pollInterval | 3 / 5s（消息级 MaxRetries 优先；解析下限 1） |
 | Saga 步骤重试解析链 | step → saga.DefaultMaxRetries → 1（下限 1） |
@@ -874,6 +917,8 @@ sequenceDiagram
 | outbox / Message / Store | 意图先落盘再分发的模式 / 意图记录 / 消息持久化抽象 |
 | Dispatcher / Handler | 拉取并分发 / 幂等处理回调（携带 ctx） |
 | Accumulator | 引擎内增量收集消息并序列化进 Payload outbox 命名空间 |
+| Collector | outbox 生产引擎装配器：还原已落盘意图、幂等收集、合并回命名空间（ADR-11） |
+| producer 骨架 | outbox 生产引擎骨架：引导/还原/分批/合并/收尾组件内固定，业务方提供记录源与意图派生（ADR-12） |
 | 单分发器前提 | 同一 Store 同时只允许一个 Dispatcher 运行 |
 | 单写者前提 | 并发模型的三条隔离前提合称：单任务单执行器、单 saga 单协调器、单分发器（§2.4） |
 | saga / SagaStep / Action / Compensation | 多步补偿事务 / 步骤定义 / 正向操作 / 逆序补偿 |
@@ -901,6 +946,8 @@ sequenceDiagram
 | ADR-8 | 通用文件能力下沉库内，垂直引擎独立扩展包 |
 | ADR-9 | Saga 终态三分与补偿可重试/可超时 |
 | ADR-10 | 便捷糖收敛组合边界；绑定指纹 fail closed |
+| ADR-11 | outbox 命名空间装配收敛为 Collector |
+| ADR-12 | outbox 生产引擎骨架下沉 `outbox/producer` |
 
 ### 10.3 待确认事项
 

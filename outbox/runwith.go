@@ -40,15 +40,11 @@ func RunWithOutbox(ctx context.Context, repo state.StateRepository, eng engine.E
 // messagesFromPayload 解析 Payload 的 outbox 命名空间；
 // 缺失该命名空间返回 nil。
 func messagesFromPayload(payload json.RawMessage) ([]Message, error) {
-	if len(payload) == 0 {
-		return nil, nil
+	raw, err := outboxNamespace(payload)
+	if err != nil {
+		return nil, err
 	}
-	var top map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &top); err != nil {
-		return nil, fmt.Errorf("outbox: parse task payload: %w", err)
-	}
-	raw, ok := top["outbox"]
-	if !ok || len(raw) == 0 || string(raw) == "null" {
+	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
 	var msgs []Message

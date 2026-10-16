@@ -3,6 +3,8 @@
 // 持久化，再由调度层以 at-least-once 分发。
 //
 // 角色划分：
+//   - Collector：生产引擎装配器——把「还原已落盘意图 → 幂等收集 → 合并回
+//     命名空间」固化为每业务步的一对括号调用（ADR-11）。
 //   - Accumulator：引擎内增量收集消息，序列化进 Payload 的 outbox 命名空间
 //     （随 checkpoint 原子落盘）。
 //   - Store：消息持久化抽象；FetchPending 返回 pending 与 processing 消息
@@ -14,6 +16,9 @@
 // 并发边界（ADR-6）：单分发器前提——同一 Store 同时至多一个 Dispatcher；
 // Store 实现须支持 Append 与 FetchPending/状态更新并发调用（典型用法：
 // 后台 Dispatcher 轮询期间，前台任务完成并 Append 新消息）。
+//
+// 生产引擎骨架见子包 outbox/producer（ADR-12）：业务方提供记录源与意图
+// 派生函数，编排由组件固定。
 package outbox
 
 import (

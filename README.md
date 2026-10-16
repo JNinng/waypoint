@@ -4,7 +4,7 @@
 
 适用场景：ETL 流水线、数据同步、批处理等一切「可分步推进且需中断恢复」的任务。
 
-> 设计规格、架构决策与验收清单见 [docs/](docs/)。本文只描述代码当前提供的能力。
+> 完整使用指南见 [docs/usage.md](docs/usage.md)；设计规格、架构决策与验收清单见 [docs/](docs/)。本文只描述代码当前提供的能力。
 
 ## 包结构
 
@@ -15,7 +15,8 @@
 | `engine` | 通用编排主循环 `Load → 对齐 → Execute → Save`；`PhaseSet` 阶段词汇表；`Run` / `WithRetry`（快照重试） |
 | `stream` | 批次管道原语 `Source` / `Sink` / `Pipeline`（含 `AsEngine` 适配）；库内文件组件 `ChunkedSink`（分块文件汇）与 `OffsetSource`（偏移行源） |
 | `filestore` | `StateRepository` 的文件后端（每任务一文件，tmp→Sync→Rename 原子写） |
-| `outbox` | 调度层 outbox 模式：`Accumulator`（意图收集）→ `Store`（持久化）→ `Dispatcher`（at-least-once 分发）；`RunWithOutbox` 桥接引擎；`outbox/filestore` 文件后端 |
+| `outbox` | 调度层 outbox 模式：`Collector`（意图收集与命名空间装配）/ `Accumulator`（收集原语）→ `Store`（持久化）→ `Dispatcher`（at-least-once 分发）；`RunWithOutbox` 桥接引擎；`outbox/filestore` 文件后端 |
+| `outbox/producer` | outbox 生产引擎骨架：业务方提供记录源与意图派生，引导/还原/分批/合并/收尾由组件固定（ADR-12） |
 | `saga` | 调度层 saga 模式：多步补偿事务（终态三分、步骤指纹校验、补偿可重试/超时） |
 | `datapipeline`（独立模块） | 导出/导入垂直引擎：`export`（分页源 + ChunkedSink）、`ingest`（OffsetSource + 幂等目标）；绑定指纹防同 id 换路径恢复 |
 

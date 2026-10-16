@@ -19,9 +19,9 @@ cd examples && go build ./... && go vet ./...      # 示例（改动导出 API �
 
 ## 模块与依赖方向
 
-- 根模块 `github.com/jninng/waypoint`：`waypoint`（根包，组合糖）/ `state` / `engine` / `stream` / `filestore` / `outbox`（含 `outbox/filestore`）/ `saga` / `internal/*`。
+- 根模块 `github.com/jninng/waypoint`：`waypoint`（根包，组合糖）/ `state` / `engine` / `stream` / `filestore` / `outbox`（含 `outbox/filestore`、`outbox/producer`）/ `saga` / `internal/*`。
 - 扩展模块 `github.com/jninng/waypoint/datapipeline`（`replace => ../`）：`export` / `ingest`。
-- **依赖必须单向**：`datapipeline → 核心`；`engine → state`；`stream → engine+state`；`outbox`/`saga` 不依赖 `engine`（唯一例外：`outbox.RunWithOutbox` 桥接）。核心不得反向依赖 datapipeline。
+- **依赖必须单向**：`datapipeline → 核心`；`engine → state`；`stream → engine+state`；`outbox`/`saga` 不依赖 `engine`（例外：`outbox.RunWithOutbox` 桥接；`outbox/producer` 组合骨架）。核心不得反向依赖 datapipeline。
 - `internal/atomicfile` 是全库唯一原子写实现（ADR-2）：任何持久化组件不得私写 tmp→Sync→Rename 逻辑。
 
 ## 修改代码时的硬约束（完整清单见设计 §8，共 30 条）

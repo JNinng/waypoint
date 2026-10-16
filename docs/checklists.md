@@ -12,6 +12,7 @@
 | 2 | `ChunkedSink` 块滚动策略当前按「批数」（默认 10）配置；按「字节阈值」滚动是否更普适（适配超大批次场景） | `stream.ChunkedSink` 选项 | 首版只做批数；出现字节敏感场景再加 `WithChunkBytes`（选项向后兼容） |
 | 3 | Saga `ActionCtx` 值限定为 JSON 可序列化类型由业务保证；是否在 Save 前主动探测并给出可定位错误 | `saga` Save 路径 | 首版维持契约声明；若测试中出现难定位失败，再加 marshaling 预检 |
 | 4 | `Dispatcher.Start` 后台轮询与 ctx 取消的组合需并发测试（轮询中取消、取消后无泄漏）；该模式是否保留在首版 API 面 | `outbox.Dispatcher` | 保留但标注「便利模式」；测试矩阵必须含 Start 的取消路径 |
+| 5 | `outbox/producer` 的记录源首版只支持「记录数切片」定位；不可由记录数定位的游标型源（文件字节偏移等）暂不支持 | `outbox/producer` | 出现真实游标源场景再加可选 `stream.Stater`（由组件持久化游标，接口向后兼容） |
 
 ## 2. 疑点清单（设计内已收敛，留档备查）
 
@@ -34,4 +35,6 @@
 - [ ] Saga：指纹不一致拒绝恢复、补偿重试/超时、终态三分、Resume 跳过已补偿，均有测试
 - [ ] Outbox：processing 重取、终败消息跳过不阻断、`ErrDuplicateID` 幂等 Append、恢复窗口对齐，均有测试
 - [ ] 便捷糖（ADR-10）：`Task.Run`/`RunWithOutbox` 与显式路径等价；绑定指纹三态（首 checkpoint 覆盖、缺失即拒、错配拒绝）两侧均有测试；`DispatchUntilIdle` 停止语义（无进展即停、不排空）有测试
+- [ ] Collector（ADR-11）：Restore 每实例一次（二次调用不清空在册）、重放 Add 幂等不重复、跨进程还原后增量收集不丢失、Flush 保留其他命名空间且空集不写，均有测试
+- [ ] producer 骨架（ADR-12）：全流程、派生失败重放续收（同实例幂等消化 + 全新实例还原）、空源、末批同次 EOF，均有测试
 - [ ] 文档断言与代码行为一致（包文档、README、示例注释），无「契约写了机制没跟」的条目
