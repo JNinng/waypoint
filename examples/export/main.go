@@ -8,8 +8,9 @@
 //  3. 故障解除后重跑同一世系：截断重放保证最终文件恰好包含全部 35 行
 //     各一次；completed checkpoint 落盘后调用 Cleanup 清理分块（ADR-3）。
 //
-// 注意：幕 1 与幕 3 是「同源、故障解除」（底层数据相同），不是同 id 换
-// 源——源内容身份无法机制化校验，属契约（ADR-10）。
+// 注意：幕 1 与幕 3 复用同一引擎与 Task——「同源、故障解除」（仅瞬态
+// 标志复位），不是同 id 换源；恢复只依赖 checkpoint，同进程复用与跨
+// 进程重建等价（源内容身份无法机制化校验，属契约，ADR-10）。
 //
 // 运行：go run ./export
 package main
@@ -75,28 +76,36 @@ func main() {
 	ctx := context.Background()
 
 	// 幕一：page 2 拉取失败 → 可重试错误，不落盘。
-	eng1 := export.New(&sliceSource{rows: rows, poisoned: true}, out, export.WithPageSize(pageSize))
-	if _, err := waypoint.NewTask(stateDir, eng1, "export-42").Run(ctx); err != nil {
+	// 一个引擎 + 一个 Task 贯穿全例：恢复只依赖 checkpoint（组件每次
+	// Execute 全量还原），同进程复用与跨进程重建等价——跨进程时以相同
+	// 三元组重建 Task 即可。
+	src := &sliceSource{rows: rows, poisoned: true}
+	eng := export.New(src, out, export.WithPageSize(pageSize))
+	task := waypoint.NewTask(stateDir, eng, "export-42")
+
+	if _, err := task.Run(ctx); err != nil {
 		fmt.Printf("第一次 Run 失败: %v\n", err)
 	}
 	printCheckpoint(stateDir, "export-42")
 
-	// 幕二（反例）：同 id 换产物路径 → 绑定指纹拒绝恢复。
+	// 幕二（反例）：同 id 换产物路径 → 绑定不同，必须另建引擎与 Task →
+	// 绑定指纹拒绝恢复（须在世系未完成时构造——终态 Run 不进 Execute）。
 	engBad := export.New(&sliceSource{rows: rows}, filepath.Join(dir, "other.jsonl"), export.WithPageSize(pageSize))
 	if _, err := waypoint.NewTask(stateDir, engBad, "export-42").Run(ctx); err != nil {
 		fmt.Printf("换产物路径重跑被拒绝: %v\n", err)
 	}
 
-	// 幕三：故障解除后重跑同一世系 → 从 checkpoint 续传至完成。
-	eng2 := export.New(&sliceSource{rows: rows}, out, export.WithPageSize(pageSize))
-	final, err := waypoint.NewTask(stateDir, eng2, "export-42").Run(ctx)
+	// 幕三：故障解除（同一数据源对象，仅瞬态标志复位）→ 同一 Task 重跑
+	// 即续传至完成。
+	src.poisoned = false
+	final, err := task.Run(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("第二次 Run 完成: phase=%s checkpoint_lsn=%d\n", final.Phase, final.CheckpointLSN)
 
 	// completed checkpoint 落盘之后，才允许清理分块（协议顺序，ADR-3）。
-	if err := eng2.Cleanup(); err != nil {
+	if err := eng.Cleanup(); err != nil {
 		log.Fatal(err)
 	}
 

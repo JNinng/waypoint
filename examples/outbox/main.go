@@ -89,15 +89,16 @@ func main() {
 	ctx := context.Background()
 
 	// 意图随 checkpoint 原子落盘，Run 成功后对齐到 Store。
-	final, err := waypoint.NewTask(dir, &notifyEngine{acc: &outbox.Accumulator{}}, "notify-1").RunWithOutbox(ctx, store)
+	task := waypoint.NewTask(dir, &notifyEngine{acc: &outbox.Accumulator{}}, "notify-1")
+	final, err := task.RunWithOutbox(ctx, store)
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("任务完成: phase=%s；意图已对齐到 Store\n", final.Phase)
 
-	// 恢复窗口演示：重调 RunWithOutbox——Run 直接返回 completed 状态，
-	// Append 撞重复 ID 幂等跳过，不产生重复消息。
-	if _, err := waypoint.NewTask(dir, &notifyEngine{acc: &outbox.Accumulator{}}, "notify-1").RunWithOutbox(ctx, store); err != nil {
+	// 恢复窗口演示：重调同一 Task 的 RunWithOutbox——completed 终态
+	// 直接返回（引擎不再执行），Append 撞重复 ID 幂等跳过，不产生重复。
+	if _, err := task.RunWithOutbox(ctx, store); err != nil {
 		log.Fatal(err)
 	}
 	pending, _ := store.FetchPending(ctx)

@@ -94,17 +94,21 @@ func main() {
 	ctx := context.Background()
 
 	// 第一次运行：第 2 批写入后「提交确认丢失」→ Run 失败。
+	// 一个引擎 + 一个 Task 贯穿全例（恢复只依赖 checkpoint，组件每次
+	// Execute 全量还原）；源路径参与绑定指纹，换 srcPath 重跑同 id 会被拒绝。
 	target := newMemTarget(true)
-	eng1 := ingest.New(srcPath, target, ingest.WithBatchSize(batchSize))
-	if _, err := waypoint.NewTask(stateDir, eng1, "ingest-42").Run(ctx); err != nil {
+	eng := ingest.New(srcPath, target, ingest.WithBatchSize(batchSize))
+	task := waypoint.NewTask(stateDir, eng, "ingest-42")
+
+	if _, err := task.Run(ctx); err != nil {
 		fmt.Printf("第一次 Run 失败: %v\n", err)
 	}
 	printCheckpoint(stateDir, "ingest-42")
 
-	// 重跑：同一目标实例（已落库的行还在），故障解除。
+	// 重跑：故障解除（同一目标对象，注入标志复位；已落库的行还在），
+	// 同一 Task 重跑 → 从源字节偏移续传。
 	target.failBatch2 = false
-	eng2 := ingest.New(srcPath, target, ingest.WithBatchSize(batchSize))
-	final, err := waypoint.NewTask(stateDir, eng2, "ingest-42").Run(ctx)
+	final, err := task.Run(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}

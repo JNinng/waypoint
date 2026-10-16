@@ -223,6 +223,37 @@ func TestExportTransientPageFailureWithRetry(t *testing.T) {
 	}
 }
 
+// 同一引擎实例跨 Run 复用：全量还原契约保证组件内存状态在每次 Execute
+// 从 checkpoint 重建，恢复不依赖实例记忆（examples 单引擎叙事的锚点）。
+func TestExportSameEngineReuseAcrossRuns(t *testing.T) {
+	base := t.TempDir()
+	out := filepath.Join(base, "export.jsonl")
+	rows := newRows(20)
+	src := &memSource{rows: rows, failPages: map[int]error{1: errors.New("page 1 transient")}}
+	repo := newMemRepo()
+	eng := New(src, out, WithPageSize(10))
+
+	// 第一次 Run：page 1 失败（failPages 自移除 → 瞬态语义）。
+	if _, err := engine.Run(context.Background(), repo, eng, "t1"); err == nil {
+		t.Fatal("期望中断")
+	}
+	// 同一引擎实例重跑：从 checkpoint 续传至完成。
+	final, err := engine.Run(context.Background(), repo, eng, "t1")
+	if err != nil {
+		t.Fatalf("同引擎复用恢复被拒: %v", err)
+	}
+	if final.Phase != "completed" || final.CheckpointLSN != 20 {
+		t.Fatalf("final = %+v", final)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != expectedLines(rows) {
+		t.Fatal("同引擎跨 Run 恢复导致最终文件与源数据不一致")
+	}
+}
+
 // 空数据源：直接 completed，产出空文件。
 func TestExportEmptySource(t *testing.T) {
 	base := t.TempDir()

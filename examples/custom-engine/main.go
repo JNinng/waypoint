@@ -94,7 +94,9 @@ func main() {
 	}
 	printCheckpoint(repo, "move-42")
 
-	// 故障消除：全新引擎实例 + 同一 taskID，外部副作用集合延续。
+	// 故障消除：全新引擎实例 + 同一 taskID，外部副作用集合延续——
+	// 恢复只依赖 checkpoint（下一个块由 CheckpointLSN 推导），
+	// 引擎实例无需携带进度记忆。
 	resumed := &chunkEngine{staged: eng.staged, failChunk: -1}
 	final, err := engine.Run(ctx, repo, resumed, "move-42")
 	if err != nil {
