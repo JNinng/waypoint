@@ -206,7 +206,7 @@ func New(dir string) (*FileRepository, error)  // MkdirAll 0755；构造时清�
 ```
 
 - 持久化语义分级：
-  - **进程崩溃安全（默认保证）**：`tmp → Sync → Rename`；`Load` 与构造入口自动清理残留 tmp。
+  - **进程崩溃安全（默认保证）**：`tmp → Sync → Rename`；构造入口自动清理残留 tmp。
   - **掉电安全（可选，默认关闭）**：Rename 后对父目录 fsync，由部署方决定启用。
 - 错误包装：哨兵与底层根因同时保留——
 
@@ -263,7 +263,7 @@ type Progressor interface { Progress(s state.BaseTaskState) int } // 0-100
 
 // Run 成功返回最终已保存状态（失败返回 nil, err）——桥接与调用方无需二次 Load。
 func Run(ctx context.Context, repo state.StateRepository, eng Engine, taskID string, opts ...RunOption) (*state.BaseTaskState, error)
-func WithRetry(maxRetries int, delay time.Duration) RunOption // 仅作用于 Execute；负值参数构造时报错
+func WithRetry(maxRetries int, delay time.Duration) RunOption // 仅作用于 Execute；负值参数构造时 panic
 ```
 
 **PhaseSet 校验清单**（`Run` 进入循环前强制，不满足即返回错误）：
@@ -584,7 +584,7 @@ type SagaState struct {
     SagaID         string
     SagaName       string
     Status         SagaStatus
-    CurrentStep    int              // 恒等于第一个未完成步骤的索引
+    CurrentStep    int              // running 期恒等于第一个未完成步骤的索引；compensating 期为当前补偿目标，全部补偿完成后为 -1
     StepStatuses   []StepStatus     // 与步骤定义一一对应
     StepErrors     []string         // 原始失败原因与补偿失败原因都持久保留
     StepFingerprint string          // 步骤定义指纹（见下）
@@ -765,7 +765,7 @@ sequenceDiagram
 | 状态文件 | `<taskID>.state` / `<taskID>.state.tmp` |
 | outbox 消息文件 | `<msgID>.msg.json` / `.msg.json.tmp` |
 | 分块 / 合并临时文件 | `<name>.chunk_<N>.tmp` / `<name>.final.tmp` |
-| 引擎重试（WithRetry） | 默认不重试（maxRetries=0）；负值参数构造时报错 |
+| 引擎重试（WithRetry） | 默认不重试（maxRetries=0）；负值参数构造时 panic |
 | Saga 日志 | 默认静默（注入 Logger 才输出） |
 
 ### 7.3 便捷调用糖（ADR-10）

@@ -33,7 +33,8 @@ final, err := waypoint.NewTask("states", eng, "export-42").Run(ctx)
 // 崩溃后以相同三元组重建 Task 再 Run 即续传；换产物路径会被绑定指纹拒绝。
 if err != nil { /* 可重试/可恢复：不落盘，下次 Run 从最后 checkpoint 恢复 */ }
 if final.Phase == state.PhaseCompleted {
-    eng.Cleanup()                                     // 终态落盘后清理分块
+    // 终态落盘后才清理分块；清理错误可见，不得静默（ADR-3）。
+    if err := eng.Cleanup(); err != nil { /* ... */ }
 }
 ```
 
@@ -61,7 +62,7 @@ func (e *myEngine) Execute(ctx context.Context, s *state.BaseTaskState) (state.L
 ## 示例
 
 各场景的可运行示例见 [examples/](examples/)（独立模块，在本目录下 `go run ./<场景>`）：
-`custom-engine`（最小引擎与恢复）、`export`（分页导出断点续传）、`ingest`（JSONL 导入）、`outbox`（意图落盘与分发）、`saga`（补偿事务与 Resume），与设计 §6 关键流程一一对应。
+`custom-engine`（最小引擎与恢复）、`export`（分页导出断点续传）、`ingest`（JSONL 导入）、`outbox`（意图落盘与分发）、`saga`（补偿事务与 Resume），分别对应设计 §5.2 引擎契约与 §6 四条关键流程。
 
 ## 关键语义（速查）
 
@@ -72,12 +73,13 @@ func (e *myEngine) Execute(ctx context.Context, s *state.BaseTaskState) (state.L
 - **不可逆操作**（发邮件、扣款、消息队列发送）不得在引擎 `Execute` 内直接执行——经 outbox / saga 在调度层处理。
 - **非目标**：任务调度器、定时器、并发池、HTTP/gRPC 服务层、多实例互斥、掉电安全默认保证（父目录 fsync 为可选启用项，未验证前不提供入口）。
 
-## 构建 与 测试
+## 构建与测试
 
-仓库含两个模块：核心模块（根）与 `datapipeline` 扩展模块（嵌套模块，
-`./...` 模式会跳过它，需分别运行）：
+仓库含三个模块：核心模块（根）与 `datapipeline`、`examples` 两个嵌套模块
+（`./...` 模式会跳过嵌套模块，需分别运行）：
 
 ```bash
 go build ./... && go test ./...     # 核心模块
 cd datapipeline && go test ./...    # 扩展模块
+cd examples && go build ./...       # 示例模块
 ```
