@@ -22,7 +22,7 @@ func (a *Accumulator) Add(msg Message) error {
 		}
 	}
 	m := cloneMessage(msg)
-	m.normalize()
+	m.Normalize()
 	a.msgs = append(a.msgs, m)
 	return nil
 }

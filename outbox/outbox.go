@@ -70,11 +70,8 @@ func cloneMessage(m Message) Message {
 }
 
 // Normalize 补全默认字段：Status 零值置 pending，CreatedAt 零值置当前时间。
-// 供后端在 Append 时调用。
-func (m *Message) Normalize() { m.normalize() }
-
-// normalize 补全默认字段（Status 零值置 pending，CreatedAt 零值置当前时间）。
-func (m *Message) normalize() {
+// 后端在 Append 时调用；Accumulator.Add 与内存后端同样经此补全。
+func (m *Message) Normalize() {
 	if m.Status == "" {
 		m.Status = StatusPending
 	}

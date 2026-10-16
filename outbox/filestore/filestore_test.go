@@ -149,7 +149,7 @@ func TestFetchPendingFIFO(t *testing.T) {
 	ids := []string{"m3", "m1", "m2"}
 	for i, id := range ids {
 		m := outbox.Message{ID: id, EventType: "e"}
-		// 通过显式 CreatedAt 控制顺序（normalize 只补零值）。
+		// 通过显式 CreatedAt 控制顺序（Normalize 只补零值）。
 		m.CreatedAt = timeAdd(i)
 		_ = s.Append(ctx, m)
 	}

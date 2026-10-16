@@ -58,7 +58,7 @@ func (s *InMemoryStore) Append(ctx context.Context, msg Message) error {
 		return fmt.Errorf("outbox: append %s: %w", msg.ID, ErrDuplicateID)
 	}
 	m := cloneMessage(msg)
-	m.normalize()
+	m.Normalize()
 	s.m[msg.ID] = m
 	return nil
 }
