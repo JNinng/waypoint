@@ -139,6 +139,28 @@ func (d *Dispatcher) resolveMaxRetries(msg Message) int {
 	return d.maxRetries
 }
 
+// DispatchUntilIdle 循环 DispatchPending 直到「一轮零投递」或出错，
+// 返回累计成功投递条数。
+//
+// 不保证排空：尚有重试余量的失败消息会留在 pending（本轮无进展即停，
+// 紧循环烧重试次数没有意义）。混合负载下的次级效应：只要同轮有其他
+// 消息投递成功，循环继续，失败消息的重试余量仍会被连续消耗（分发器
+// 无退避）——需要重试间隔请用 Start 轮询或调用方自控节奏。
+// ctx 取消：返回已累计条数与 ctx.Err()。
+func (d *Dispatcher) DispatchUntilIdle(ctx context.Context) (int, error) {
+	delivered := 0
+	for {
+		n, err := d.DispatchPending(ctx)
+		delivered += n
+		if err != nil {
+			return delivered, err
+		}
+		if n == 0 {
+			return delivered, nil
+		}
+	}
+}
+
 // Start 是后台 ticker 轮询的便利模式（非调度框架）。
 // 阻塞直至 ctx 取消；轮询中的分发错误经注入 Logger 记录。
 func (d *Dispatcher) Start(ctx context.Context) {

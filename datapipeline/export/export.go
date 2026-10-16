@@ -14,6 +14,8 @@ package export
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,10 +24,15 @@ import (
 
 	"github.com/jninng/waypoint/datapipeline"
 	"github.com/jninng/waypoint/engine"
+	"github.com/jninng/waypoint/state"
 	"github.com/jninng/waypoint/stream"
 )
 
 const taskType = "export"
+
+// bindingNS 是本引擎在 Payload 中的自持命名空间（设计 §3：各参与方
+// 自持子块、组合引擎负责拼装）。
+const bindingNS = "export"
 
 // RowMarshaler 把一行数据编码为原始行字节（不含行尾符）。
 type RowMarshaler func(row datapipeline.Row) ([]byte, error)
@@ -34,6 +41,7 @@ type RowMarshaler func(row datapipeline.Row) ([]byte, error)
 type Engine struct {
 	engine.Engine // stream.Pipeline.AsEngine("export")
 	sink          *stream.ChunkedSink
+	outputPath    string
 }
 
 // Option 配置导出引擎。
@@ -84,11 +92,89 @@ func New(src datapipeline.DataSource, outputPath string, opts ...Option) *Engine
 	}
 	p := stream.New[[]byte](&pageSource{ds: src, marshaler: cfg.rowMarshaler}, sink,
 		stream.WithBatchSize[[]byte](cfg.pageSize))
-	return &Engine{Engine: p.AsEngine(taskType), sink: sink}
+	return &Engine{Engine: p.AsEngine(taskType), sink: sink, outputPath: outputPath}
 }
 
 // Cleanup 转发 ChunkedSink.Cleanup；终态 checkpoint 保存之后由调用方调用。
 func (e *Engine) Cleanup() error { return e.sink.Cleanup() }
+
+// Execute 重载内嵌引擎：先写入或校验绑定指纹，再委托管道。
+func (e *Engine) Execute(ctx context.Context, s *state.BaseTaskState) (state.LSN, error) {
+	if err := e.bindFingerprint(s); err != nil {
+		return 0, err
+	}
+	return e.Engine.Execute(ctx, s)
+}
+
+type bindingState struct {
+	Binding string `json:"binding"`
+}
+
+// bindingHash 计算绑定指纹（SHA-256 over 产物路径）。
+func bindingHash(outputPath string) string {
+	sum := sha256.Sum256([]byte(outputPath))
+	return hex.EncodeToString(sum[:])
+}
+
+// bindFingerprint 维护自持命名空间的绑定指纹（ADR-10）：
+//
+//   - 新任务（PhasePending，含首个 checkpoint 的 pending→running 步）：
+//     写入指纹——首个 checkpoint 必须携带，否则「crash 于首个 checkpoint
+//     之后」的恢复将无指纹可校验；
+//   - 恢复（其余阶段）：指纹缺失即拒绝（fail closed——留白等于绕过校验，
+//     库无历史数据兼容负担），不一致拒绝（同 taskID 换产物路径）。
+//
+// 校验失败表现为可重试 error：WithRetry 会空转耗尽后返回，不落盘。
+// 挂点说明：engine.Aligner 契约只传递 LSN（§5.2），指纹校验因此固定在
+// Execute 首步；终态任务 Run 直接返回、不进 Execute，故不校验（终态无
+// 副作用）。恢复同 taskID 必须绑定同源——源身份无法泛化哈希，为契约。
+func (e *Engine) bindFingerprint(s *state.BaseTaskState) error {
+	top, err := decodeNamespaces(s.Payload)
+	if err != nil {
+		return err
+	}
+	bind := bindingHash(e.outputPath)
+	if raw, ok := top[bindingNS]; ok && len(raw) > 0 && string(raw) != "null" {
+		var st bindingState
+		if err := json.Unmarshal(raw, &st); err != nil {
+			return fmt.Errorf("export: parse binding fingerprint: %w", err)
+		}
+		if st.Binding != bind {
+			return fmt.Errorf("export: binding fingerprint mismatch for task %s: checkpoint bound to output %s, engine bound to %s — refusing to resume with a different output path", s.TaskID, st.Binding, bind)
+		}
+		return nil
+	}
+	if s.Phase != state.PhasePending {
+		return fmt.Errorf("export: checkpoint for task %s lacks binding fingerprint: refusing to resume", s.TaskID)
+	}
+	raw, err := json.Marshal(bindingState{Binding: bind})
+	if err != nil {
+		return fmt.Errorf("export: marshal binding fingerprint: %w", err)
+	}
+	top[bindingNS] = raw
+	out, err := json.Marshal(top)
+	if err != nil {
+		return fmt.Errorf("export: marshal payload: %w", err)
+	}
+	s.Payload = out
+	return nil
+}
+
+// decodeNamespaces 把任务 Payload 解析为顶层命名空间表（空/null → 空表）。
+// 与 ingest 各自持有一份——垂直包独立演进（ADR-8），命名空间自持（§3）。
+func decodeNamespaces(payload json.RawMessage) (map[string]json.RawMessage, error) {
+	top := map[string]json.RawMessage{}
+	if len(payload) == 0 || string(payload) == "null" {
+		return top, nil
+	}
+	if err := json.Unmarshal(payload, &top); err != nil {
+		return nil, fmt.Errorf("export: parse task payload: %w", err)
+	}
+	if top == nil {
+		top = map[string]json.RawMessage{}
+	}
+	return top, nil
+}
 
 func defaultMarshaler(row datapipeline.Row) ([]byte, error) {
 	return json.Marshal(row)

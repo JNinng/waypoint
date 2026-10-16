@@ -36,6 +36,7 @@
 
 ```
 waypoint/                          # 核心库（单一 module）
+├── waypoint/                  # 便捷调用糖（组合边界）：Task 世系句柄（ADR-10）
 ├── state/                     # 领域模型：Phase / LSN / BaseTaskState / StateRepository / 哨兵错误
 ├── engine/                    # 通用编排：Engine + PhaseSet + Run() + WithRetry
 ├── stream/                    # 批次管道原语：Source / Sink / Pipeline
@@ -70,6 +71,7 @@ internal/atomicfile ←── filestore / outbox.filestore（共用唯一原子�
 - `engine` 只依赖 `state`。
 - `stream` 依赖 `engine`/`state`（`Pipeline` 提供引擎骨架，由适配引擎组合）。
 - `outbox` / `saga` 是独立状态机，不依赖 `engine`；与引擎的组合由调用方完成，outbox 另提供桥接入口 `RunWithOutbox`（依赖 `engine` 与 `state`，见 §5.6）。
+- 根包 `waypoint` 是组合边界（ADR-10）：依赖 `engine`/`filestore`/`outbox`/`state`，仅做既有调用的顺序转发（糖），无业务逻辑、无自有状态类型以外的概念。
 - `datapipeline` 依赖核心包，核心包不得反向依赖它。
 
 ### 2.3 设计原则
@@ -396,6 +398,7 @@ func NewChunkedSink(dir, finalName string, opts ...ChunkedSinkOption) *ChunkedSi
 - **`Finalize`**：按块序拼接全部分块至 `<finalName>.final.tmp`，`Sync + Rename` 为最终文件——最终产物原子出现；**不得删除分块**（分块是重放输入）。
 - **`Cleanup() error`**：删除全部分块与残留 `.final.tmp`。**必须在 completed checkpoint Save 成功之后由调用方显式调用**；返回 error，目录读取与删除失败必须可见。
 - LSN：分块模式下汇无 `Positioner`/`Aligner`（重放由截断保证安全），管道 LSN 回退「累计已处理项数」，块进度由 Stater 承载。
+- **一产物路径一世系**：分块与最终文件名均由 `outputPath` 派生，同一 `outputPath` 同一时刻只归属一个 taskID 世系；多世系共享/交错使用同一输出路径会互相覆盖，属调用方违约（指纹拦不住各自的自洽绑定）。
 
 **失败模式**：块写到一半崩溃 → 恢复重放截断到已提交边界；Finalize 中途崩溃 → 只残留 tmp，已 Rename 的最终文件绝不被破坏；调用方在终态 Save 前误调 Cleanup → 分块丢失、completed 无法重放（协议规定调用顺序，Cleanup 前置属调用方违约）。
 
@@ -461,6 +464,14 @@ func New(srcPath string, target DataTarget, opts ...Option) *Engine
 ```
 
 命名纪律：包名 = TaskType = 概念名（`export` / `ingest`），导出/导入全链路一名。
+
+**绑定指纹（ADR-10）**：各垂直引擎在 Payload 的自持命名空间（`"export"` / `"ingest"` 键）维护绑定指纹（SHA-256 over 各自的产物路径 / 源文件路径），防止同 taskID 换绑定恢复：
+
+- **首个 checkpoint 必须携带**：wrapper 在 pending→running 步（`Pipeline.Execute` 的提前返回步）也写入指纹，否则「crash 于首个 checkpoint 之后」的恢复将无指纹可校验；
+- **缺失即拒（fail closed）**：恢复时 checkpoint 无指纹 = 拒绝（留白等于绕过校验；库无历史数据兼容负担）；
+- **不一致即拒**：同 taskID 换产物/源路径 → 返回可重试 error（`WithRetry` 会空转耗尽后返回，不落盘）；
+- **挂点在 Execute 首步**：`engine.Aligner` 契约只传递 LSN（§5.2「Aligner 不得依赖 Stater 内容」），指纹不在 Align 时校验；源侧 Align 仅 Stat + 内存赋值、无副作用，故无安全性损失；终态任务 Run 直接返回、不进 Execute，故不校验（终态无副作用）；
+- 三重关联的分工：id×引擎由 TaskType 校验强制（§5.2）；id×产物/源路径由绑定指纹强制；id×源内容（同路径换数据）无法机制化，为契约（源内容相同、仅瞬态故障解除的重跑合法）。
 
 **失败模式**：分页源不保证页幂等 → 崩溃后重放页可能偏移（游标 Stater 与块进度同 checkpoint 原子保存规避）；目标不幂等 → 重放重复入库（DataTarget 契约禁止）。
 
@@ -731,13 +742,14 @@ sequenceDiagram
 
 | 包 | 导出面 |
 |---|---|
+| `waypoint` | `Task`/`NewTask`、`Task.Run`、`Task.RunWithOutbox`（组合糖，ADR-10） |
 | `state` | `Phase`（4 常量）、`LSN`、`BaseTaskState`、`StateRepository`、`ErrSaveFailed`/`ErrLoadFailed` |
 | `engine` | `Engine`、`PhaseSet`（含 `IsTerminal`/`IsRecoverable`）、`DefaultPhaseSet`、`Aligner`、`Progressor`、`Run`、`RunOption`/`WithRetry` |
 | `stream` | `Source`、`Sink`、`Positioner`、`Sizer`、`Stater`、`Finalizer`、`Pipeline`/`New`/`WithBatchSize`/`AsEngine`、`ChunkedSink`/`NewChunkedSink`、`OffsetSource`/`NewOffsetSource` |
 | `filestore` | `FileRepository`/`New` |
-| `outbox` | `Message`（含 `Normalize`——后端 Append 时补默认字段）、`MessageStatus`（4 值）、`Handler`、`HandlerRegistry`、`Store`、`InMemoryStore`、`Dispatcher` 及选项、`Accumulator`、`ErrDuplicateID`、`RunWithOutbox`、`filestore.FileStore`/`New` |
+| `outbox` | `Message`（含 `Normalize`——后端 Append 时补默认字段）、`MessageStatus`（4 值）、`Handler`、`HandlerRegistry`/`NewHandlerRegistry`、`Store`、`InMemoryStore`、`Dispatcher`（含 `DispatchUntilIdle`）及选项、`Accumulator`、`ErrDuplicateID`、`RunWithOutbox`、`filestore.FileStore`/`New` |
 | `saga` | `SagaStatus`（6 值）、`StepStatus`（5 值）、`SagaStep`、`SagaState`、`SagaStore`、`InMemorySagaStore`、`Saga`、`SagaCoordinator`/`Run`/`Resume`、`WithSagaLogger` |
-| `datapipeline` | `Row`、`DataSource`、`DataTarget`、`export.New`、`ingest.New` 及选项 |
+| `datapipeline` | `Row`、`DataSource`、`DataTarget`、`export.New`/`Cleanup`、`ingest.New` 及选项（绑定指纹为内部机制，不占导出面） |
 
 测试/调试专用方法（如内存存储的查询辅助）不进生产导出面，收入 `_test` 支撑包。
 
@@ -755,6 +767,15 @@ sequenceDiagram
 | 分块 / 合并临时文件 | `<name>.chunk_<N>.tmp` / `<name>.final.tmp` |
 | 引擎重试（WithRetry） | 默认不重试（maxRetries=0）；负值参数构造时报错 |
 | Saga 日志 | 默认静默（注入 Logger 才输出） |
+
+### 7.3 便捷调用糖（ADR-10）
+
+糖是**组合边界上的薄函数**：只做既有调用按固定顺序的转发，零新逻辑、零自有状态。准入门槛是**繁琐度**（多步样板 ≥ 3 句），不为「一概念一名」的对称性加糖（saga 调用已足够简短，故不配糖）。
+
+- **`waypoint.Task`（世系句柄）**：绑定 `状态目录 × 引擎（含源/产物）× taskID` ——三者同生共死，跨进程恢复以相同三元组重建。`Run` 每次调用只传 ctx（+可选重试）。句柄粒度必须是**世系**而非「绑定」：同一绑定多 id 会共享产物路径、互相覆盖分块（§5.4.1 一产物路径一世系）。
+- **工学定位**：Task 缩短正确用法，**不拦截错误用法**——安全由机制承载（TaskType 校验防跨引擎、绑定指纹防同引擎换路径、PhaseSet/指纹 fail-closed 防脏状态）。dir 合法性延迟到 Run 校验（构造不触盘）。
+- **`DispatchUntilIdle`**：排空语义的诚实命名——无进展即停，不保证排空（失败消息带重试余量留在 pending；混合负载下余量会被连续消耗，分发器无退避）。
+- **非目标**：Task 不提供 Delete；根包不 re-export `state` 常量；不做 Kit/Builder 门面；不自动 Cleanup、不自动分发（责任归属不变，见 ADR-3 与 §6.3）。
 
 ---
 
@@ -860,6 +881,10 @@ sequenceDiagram
 | 终态三分 | completed / compensated（已回滚）/ failed（补偿失败需人工介入） |
 | 原子写原语 | 库内唯一 tmp→Sync→Rename 实现（internal/atomicfile） |
 | datapipeline | 导出/导入垂直引擎的独立扩展包 |
+| 世系（lineage） | 一次可恢复任务的身份三元组：(taskID, 源, 产物)，同生共死；Task 是其句柄 |
+| Task | 根包 waypoint 的世系句柄：状态目录 + 引擎 + taskID 的不可变绑定（组合糖） |
+| 绑定指纹 | 垂直引擎写入自持命名空间的路径哈希（export→产物路径、ingest→源路径）；恢复时缺失即拒、不一致即拒（ADR-10） |
+| DispatchUntilIdle | Dispatcher 的排空便利：循环分发直到一轮零投递；不保证排空失败消息 |
 
 ### 10.2 ADR 索引
 
@@ -874,6 +899,7 @@ sequenceDiagram
 | ADR-7 | 一切处理回调携带 ctx |
 | ADR-8 | 通用文件能力下沉库内，垂直引擎独立扩展包 |
 | ADR-9 | Saga 终态三分与补偿可重试/可超时 |
+| ADR-10 | 便捷糖收敛组合边界；绑定指纹 fail closed |
 
 ### 10.3 待确认事项
 

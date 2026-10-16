@@ -7,6 +7,8 @@ package ingest
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/jninng/waypoint/datapipeline"
 	"github.com/jninng/waypoint/engine"
+	"github.com/jninng/waypoint/state"
 	"github.com/jninng/waypoint/stream"
 )
 
@@ -28,6 +31,7 @@ type RowUnmarshaler func(line []byte) (datapipeline.Row, error)
 type Engine struct {
 	engine.Engine // stream.Pipeline.AsEngine("ingest")
 	src           *decodeSource
+	srcPath       string
 }
 
 // Option 配置导入引擎。
@@ -66,12 +70,89 @@ func New(srcPath string, target datapipeline.DataTarget, opts ...Option) *Engine
 	src := &decodeSource{src: stream.NewOffsetSource(srcPath), unmarshaler: cfg.rowUnmarshaler}
 	p := stream.New[datapipeline.Row](src, &targetSink{target: target},
 		stream.WithBatchSize[datapipeline.Row](cfg.batchSize))
-	return &Engine{Engine: p.AsEngine(taskType), src: src}
+	return &Engine{Engine: p.AsEngine(taskType), src: src, srcPath: srcPath}
 }
 
 // Align 实现 engine.Aligner：转发源侧补偿（校验源文件大小 ≥ LSN）。
+// 绑定指纹不在此时校验——engine.Aligner 契约只传递 LSN（§5.2「Aligner
+// 不得依赖 Stater 内容」），且源侧 Align 仅 Stat + 内存赋值、无副作用，
+// Execute 首步校验不损失安全性。
 func (e *Engine) Align(ctx context.Context, targetLSN int64) error {
 	return e.src.Align(ctx, targetLSN)
+}
+
+// bindingNS 是本引擎在 Payload 中的自持命名空间（设计 §3）。
+const bindingNS = "ingest"
+
+type bindingState struct {
+	Binding string `json:"binding"`
+}
+
+// bindingHash 计算绑定指纹（SHA-256 over 源文件路径）。
+func bindingHash(srcPath string) string {
+	sum := sha256.Sum256([]byte(srcPath))
+	return hex.EncodeToString(sum[:])
+}
+
+// Execute 重载内嵌引擎：先写入或校验绑定指纹，再委托管道。
+func (e *Engine) Execute(ctx context.Context, s *state.BaseTaskState) (state.LSN, error) {
+	if err := e.bindFingerprint(s); err != nil {
+		return 0, err
+	}
+	return e.Engine.Execute(ctx, s)
+}
+
+// bindFingerprint 维护自持命名空间的绑定指纹（ADR-10）：新任务（含首个
+// checkpoint 的 pending→running 步）写入源路径指纹；恢复时缺失即拒
+// （fail closed）、不一致拒绝（同 taskID 换源路径）。源文件内容身份
+// （同路径换数据）无法机制化，为契约；部分场景由源侧 Align 的大小校验
+// 兜底。校验失败为可重试 error，不落盘。
+func (e *Engine) bindFingerprint(s *state.BaseTaskState) error {
+	top, err := decodeNamespaces(s.Payload)
+	if err != nil {
+		return err
+	}
+	bind := bindingHash(e.srcPath)
+	if raw, ok := top[bindingNS]; ok && len(raw) > 0 && string(raw) != "null" {
+		var st bindingState
+		if err := json.Unmarshal(raw, &st); err != nil {
+			return fmt.Errorf("ingest: parse binding fingerprint: %w", err)
+		}
+		if st.Binding != bind {
+			return fmt.Errorf("ingest: binding fingerprint mismatch for task %s: checkpoint bound to source %s, engine bound to %s — refusing to resume with a different source path", s.TaskID, st.Binding, bind)
+		}
+		return nil
+	}
+	if s.Phase != state.PhasePending {
+		return fmt.Errorf("ingest: checkpoint for task %s lacks binding fingerprint: refusing to resume", s.TaskID)
+	}
+	raw, err := json.Marshal(bindingState{Binding: bind})
+	if err != nil {
+		return fmt.Errorf("ingest: marshal binding fingerprint: %w", err)
+	}
+	top[bindingNS] = raw
+	out, err := json.Marshal(top)
+	if err != nil {
+		return fmt.Errorf("ingest: marshal payload: %w", err)
+	}
+	s.Payload = out
+	return nil
+}
+
+// decodeNamespaces 把任务 Payload 解析为顶层命名空间表（空/null → 空表）。
+// 与 export 各自持有一份——垂直包独立演进（ADR-8），命名空间自持（§3）。
+func decodeNamespaces(payload json.RawMessage) (map[string]json.RawMessage, error) {
+	top := map[string]json.RawMessage{}
+	if len(payload) == 0 || string(payload) == "null" {
+		return top, nil
+	}
+	if err := json.Unmarshal(payload, &top); err != nil {
+		return nil, fmt.Errorf("ingest: parse task payload: %w", err)
+	}
+	if top == nil {
+		top = map[string]json.RawMessage{}
+	}
+	return top, nil
 }
 
 func defaultUnmarshaler(line []byte) (datapipeline.Row, error) {

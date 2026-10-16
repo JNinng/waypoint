@@ -1,10 +1,11 @@
 // 示例：outbox 模式——意图先落盘后分发（设计 §6.3 / §5.6）。
 //
 // 业务引擎在 Execute 内收集不可逆操作意图（Accumulator → Payload 的
-// outbox 命名空间，随 checkpoint 原子落盘）；RunWithOutbox 把最终状态的
-// 意图幂等对齐到 Store（重复 ID 跳过，覆盖「Run 成功但 Append 前崩溃」
-// 窗口）；Dispatcher 以 at-least-once 分发到幂等 Handler——传真「线路忙」
-// 演示失败回退 pending、下一轮重投。
+// outbox 命名空间，随 checkpoint 原子落盘）；Task.RunWithOutbox 把最终
+// 状态的意图幂等对齐到 Store（重复 ID 跳过，覆盖「Run 成功但 Append 前
+// 崩溃」窗口）；Dispatcher 以 at-least-once 分发到幂等 Handler。
+// DispatchUntilIdle 演示「无进展即停」：传真两次「线路忙」后停止——
+// 不排空，失败消息带重试余量留在 pending，再次分发才投出。
 //
 // 运行：go run ./outbox
 package main
@@ -16,12 +17,11 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 
 	"github.com/jninng/waypoint/engine"
-	"github.com/jninng/waypoint/filestore"
 	"github.com/jninng/waypoint/outbox"
 	"github.com/jninng/waypoint/state"
+	"github.com/jninng/waypoint/waypoint"
 )
 
 // notifyEngine 通知任务：收集 3 条不可逆操作意图（不直接执行——
@@ -85,15 +85,11 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	repo, err := filestore.New(filepath.Join(dir, "states"))
-	if err != nil {
-		log.Fatal(err)
-	}
 	store := outbox.NewInMemoryStore()
 	ctx := context.Background()
 
 	// 意图随 checkpoint 原子落盘，Run 成功后对齐到 Store。
-	final, err := outbox.RunWithOutbox(ctx, repo, &notifyEngine{acc: &outbox.Accumulator{}}, "notify-1", store)
+	final, err := waypoint.NewTask(dir, &notifyEngine{acc: &outbox.Accumulator{}}, "notify-1").RunWithOutbox(ctx, store)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -101,42 +97,49 @@ func main() {
 
 	// 恢复窗口演示：重调 RunWithOutbox——Run 直接返回 completed 状态，
 	// Append 撞重复 ID 幂等跳过，不产生重复消息。
-	if _, err := outbox.RunWithOutbox(ctx, repo, &notifyEngine{acc: &outbox.Accumulator{}}, "notify-1", store); err != nil {
+	if _, err := waypoint.NewTask(dir, &notifyEngine{acc: &outbox.Accumulator{}}, "notify-1").RunWithOutbox(ctx, store); err != nil {
 		log.Fatal(err)
 	}
 	pending, _ := store.FetchPending(ctx)
 	fmt.Printf("重调 RunWithOutbox 幂等: pending=%d 条\n", len(pending))
 
-	// 分发：注册幂等 Handler；传真第一次「线路忙」→ 回退 pending，下轮重投。
-	registry := &outbox.HandlerRegistry{}
-	registry.Register("email", func(ctx context.Context, m outbox.Message) error {
-		fmt.Printf("  邮件已发送 → %s\n", m.Payload)
-		return nil
-	})
-	registry.Register("sms", func(ctx context.Context, m outbox.Message) error {
-		fmt.Printf("  短信已发送 → %s\n", m.Payload)
-		return nil
-	})
+	// 分发：字面量注册幂等 Handler；传真前两次「线路忙」——
+	// DispatchUntilIdle 在无进展的轮次停止（不排空）。
 	faxAttempts := 0
-	registry.Register("fax", func(ctx context.Context, m outbox.Message) error {
-		faxAttempts++
-		if faxAttempts == 1 {
-			return errors.New("fax line busy")
-		}
-		fmt.Printf("  传真已发送（第 %d 次尝试）→ %s\n", faxAttempts, m.Payload)
-		return nil
+	registry := outbox.NewHandlerRegistry(map[string]outbox.Handler{
+		"email": func(ctx context.Context, m outbox.Message) error {
+			fmt.Printf("  邮件已发送 → %s\n", m.Payload)
+			return nil
+		},
+		"sms": func(ctx context.Context, m outbox.Message) error {
+			fmt.Printf("  短信已发送 → %s\n", m.Payload)
+			return nil
+		},
+		"fax": func(ctx context.Context, m outbox.Message) error {
+			faxAttempts++
+			if faxAttempts < 3 {
+				return errors.New("fax line busy")
+			}
+			fmt.Printf("  传真已发送（第 %d 次尝试）→ %s\n", faxAttempts, m.Payload)
+			return nil
+		},
 	})
 	dispatcher := outbox.NewDispatcher(store, registry)
 
-	n1, err := dispatcher.DispatchPending(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-	n2, err := dispatcher.DispatchPending(ctx)
+	delivered, err := dispatcher.DispatchUntilIdle(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
 	pending, _ = store.FetchPending(ctx)
-	fmt.Printf("分发两轮: 投递 %d + %d 条，剩余 pending=%d（at-least-once，重放由幂等 Handler 消化）\n",
-		n1, n2, len(pending))
+	fmt.Printf("分发至无进展: 投递 %d 条，剩余 pending=%d（不排空：失败消息带余量留待下次）\n",
+		delivered, len(pending))
+
+	// 再次分发：传真第 3 次尝试成功，全部投递完成。
+	delivered, err = dispatcher.DispatchPending(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	pending, _ = store.FetchPending(ctx)
+	fmt.Printf("再次分发: 投递 %d 条，剩余 pending=%d（at-least-once，重放由幂等 Handler 消化）\n",
+		delivered, len(pending))
 }

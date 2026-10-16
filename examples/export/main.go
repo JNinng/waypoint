@@ -1,10 +1,15 @@
 // 示例：分页导出断点续传（设计 §6.1）。
 //
-// 35 行业务数据分页导出为 JSONL；第 3 页（page=2）首次拉取失败——
-// Run 返回 error 不落盘，任务停留于最后 checkpoint（前 20 行）。
-// 重跑：全新引擎从第 3 页继续，截断重放保证最终文件恰好包含全部 35 行
-// 各一次；completed checkpoint 落盘后调用 Cleanup 清理分块中间产物
-// （协议顺序，ADR-3）。
+// 三幕结构：
+//  1. 35 行业务数据分页导出为 JSONL，第 3 页（page=2）拉取失败——Run
+//     返回 error 不落盘，任务停留于最后 checkpoint（前 20 行）。
+//  2. 反例：同 taskID 换产物路径重跑 → 绑定指纹拒绝恢复（须在世系未
+//     完成时——终态 Run 直接返回、不进 Execute，无从校验）。
+//  3. 故障解除后重跑同一世系：截断重放保证最终文件恰好包含全部 35 行
+//     各一次；completed checkpoint 落盘后调用 Cleanup 清理分块（ADR-3）。
+//
+// 注意：幕 1 与幕 3 是「同源、故障解除」（底层数据相同），不是同 id 换
+// 源——源内容身份无法机制化校验，属契约（ADR-10）。
 //
 // 运行：go run ./export
 package main
@@ -21,9 +26,8 @@ import (
 
 	"github.com/jninng/waypoint/datapipeline"
 	"github.com/jninng/waypoint/datapipeline/export"
-	"github.com/jninng/waypoint/engine"
-	"github.com/jninng/waypoint/filestore"
 	"github.com/jninng/waypoint/state"
+	"github.com/jninng/waypoint/waypoint"
 )
 
 const (
@@ -65,24 +69,27 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	repo, err := filestore.New(filepath.Join(dir, "states"))
-	if err != nil {
-		log.Fatal(err)
-	}
+	stateDir := filepath.Join(dir, "states")
 	out := filepath.Join(dir, "orders.jsonl")
 	rows := makeRows(totalRows)
 	ctx := context.Background()
 
-	// 第一次运行：page 2 拉取失败 → 可重试错误，不落盘。
+	// 幕一：page 2 拉取失败 → 可重试错误，不落盘。
 	eng1 := export.New(&sliceSource{rows: rows, poisoned: true}, out, export.WithPageSize(pageSize))
-	if _, err := engine.Run(ctx, repo, eng1, "export-42"); err != nil {
+	if _, err := waypoint.NewTask(stateDir, eng1, "export-42").Run(ctx); err != nil {
 		fmt.Printf("第一次 Run 失败: %v\n", err)
 	}
-	printCheckpoint(repo, "export-42")
+	printCheckpoint(stateDir, "export-42")
 
-	// 故障消除后重跑：全新引擎实例，同一 taskID 与输出路径。
+	// 幕二（反例）：同 id 换产物路径 → 绑定指纹拒绝恢复。
+	engBad := export.New(&sliceSource{rows: rows}, filepath.Join(dir, "other.jsonl"), export.WithPageSize(pageSize))
+	if _, err := waypoint.NewTask(stateDir, engBad, "export-42").Run(ctx); err != nil {
+		fmt.Printf("换产物路径重跑被拒绝: %v\n", err)
+	}
+
+	// 幕三：故障解除后重跑同一世系 → 从 checkpoint 续传至完成。
 	eng2 := export.New(&sliceSource{rows: rows}, out, export.WithPageSize(pageSize))
-	final, err := engine.Run(ctx, repo, eng2, "export-42")
+	final, err := waypoint.NewTask(stateDir, eng2, "export-42").Run(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -101,14 +108,11 @@ func main() {
 	fmt.Printf("最终文件 %d 行: 首行=%s 末行=%s\n", len(lines), lines[0], lines[len(lines)-1])
 }
 
-func printCheckpoint(repo state.StateRepository, taskID string) {
-	data, err := repo.Load(context.Background(), taskID)
+// printCheckpoint 直接读状态文件（Task 隐藏了 repo，演示用直读）。
+func printCheckpoint(stateDir, taskID string) {
+	data, err := os.ReadFile(filepath.Join(stateDir, taskID+".state"))
 	if err != nil {
 		log.Fatal(err)
-	}
-	if data == nil {
-		fmt.Println("  checkpoint: 无（未落盘）")
-		return
 	}
 	var s state.BaseTaskState
 	if err := json.Unmarshal(data, &s); err != nil {

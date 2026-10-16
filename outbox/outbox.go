@@ -96,6 +96,15 @@ type HandlerRegistry struct {
 	m  map[string]Handler
 }
 
+// NewHandlerRegistry 以字面量构造路由表；增量注册仍用 Register。
+func NewHandlerRegistry(handlers map[string]Handler) *HandlerRegistry {
+	r := &HandlerRegistry{}
+	for eventType, h := range handlers {
+		r.Register(eventType, h)
+	}
+	return r
+}
+
 // Register 覆盖式注册 eventType 的 Handler。
 func (r *HandlerRegistry) Register(eventType string, h Handler) {
 	r.mu.Lock()

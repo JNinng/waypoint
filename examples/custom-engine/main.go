@@ -7,6 +7,9 @@
 // 场景二：优雅失败——引擎在 Execute 内置 PhaseFailed 并返回 nil，
 // 这是唯一落盘的失败路径（框架不兜底写终态）。
 //
+// 本例刻意走显式路径（filestore.New + engine.Run）以展示引擎契约本身；
+// 日常调用可用等价糖：waypoint.NewTask(stateDir, eng, taskID).Run(ctx)。
+//
 // 运行：go run ./custom-engine
 package main
 
